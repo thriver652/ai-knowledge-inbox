@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { after, before, describe, it } from 'node:test';
 import pino from 'pino';
-import { createOpenAIProvider } from '../src/ai/openaiProvider.js';
+import { createOpenAIProvider, retryDelaySeconds } from '../src/ai/openaiProvider.js';
 import { buildTestApp } from './helpers.js';
 
 // A fake OpenAI-compatible server: deterministic "embeddings" (bag of known words) and a
@@ -10,14 +10,21 @@ import { buildTestApp } from './helpers.js';
 const VOCAB = ['backup', 'postgres', 'nightly', 'tea', 'coffee', 'alice', 'bob', 'database'];
 const fakeEmbed = (text) => VOCAB.map((w) => (text.toLowerCase().includes(w) ? 1 : 0)).concat([0.01]);
 
-function startFakeOpenAI({ failChat = false } = {}) {
+function startFakeOpenAI({ failChat = false, rateLimitEmbeddings = 0 } = {}) {
   const calls = { embeddings: [], chat: [] };
+  let embedRejections = 0;
   const server = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw || '{}');
     res.setHeader('content-type', 'application/json');
     if (req.url.endsWith('/embeddings')) {
+      if (embedRejections < rateLimitEmbeddings) {
+        // Mimic Gemini's free-tier quota error (no Retry-After header, hint in the message).
+        embedRejections++;
+        res.statusCode = 429;
+        return res.end(JSON.stringify({ error: { code: 429, message: 'Quota exceeded for metric: embed_content_free_tier_requests, limit: 100. Please retry in 2.5s.' } }));
+      }
       calls.embeddings.push(body);
       const inputs = Array.isArray(body.input) ? body.input : [body.input];
       // Return out of order to prove the provider sorts by index.
@@ -93,6 +100,53 @@ describe('OpenAI provider (against a fake OpenAI-compatible server)', () => {
       assert.match(res.body.error.message, /chat/);
     } finally {
       failing.server.close();
+    }
+  });
+});
+
+describe('provider rate limits (429)', () => {
+  const silent = pino({ level: 'silent' });
+  const make = (baseURL, sleeps) =>
+    createOpenAIProvider(
+      { apiKey: 't', baseURL, embeddingModel: 'e', chatModel: 'c', timeoutMs: 5000, maxRetries: 0 },
+      silent,
+      { sleep: async (ms) => { sleeps.push(ms); } },
+    );
+
+  it('parses the wait from Retry-After or the message, with a cap', () => {
+    assert.equal(retryDelaySeconds({ message: 'Please retry in 22.27s.' }), 23);
+    assert.equal(retryDelaySeconds({ headers: { 'retry-after': '7' }, message: '' }), 7);
+    assert.equal(retryDelaySeconds({ message: 'retry in 9999s' }), 65);
+    assert.equal(retryDelaySeconds({ message: 'no hint' }), 30);
+  });
+
+  it('background indexing waits out a 429 and the item still becomes ready', async () => {
+    const fake = await startFakeOpenAI({ rateLimitEmbeddings: 2 });
+    try {
+      const sleeps = [];
+      const { api, jobQueue } = buildTestApp({ ai: make(fake.baseURL, sleeps) });
+      const res = await api.post('/api/ingest', { type: 'note', content: 'Postgres backup runs nightly.' });
+      await jobQueue.onIdle();
+      const { item } = (await api.get(`/api/items/${res.body.item.id}`)).body;
+      assert.equal(item.status, 'ready');
+      assert.deepEqual(sleeps, [3000, 3000]); // waited as instructed, twice
+    } finally {
+      fake.server.close();
+    }
+  });
+
+  it('an interactive query fails fast with 503 AI_RATE_LIMITED and Retry-After', async () => {
+    const fake = await startFakeOpenAI({ rateLimitEmbeddings: 1 });
+    try {
+      const sleeps = [];
+      const { api } = buildTestApp({ ai: make(fake.baseURL, sleeps) });
+      const res = await api.post('/api/query', { question: 'when is the backup?' });
+      assert.equal(res.status, 503);
+      assert.equal(res.body.error.code, 'AI_RATE_LIMITED');
+      assert.equal(res.headers['retry-after'], '3');
+      assert.deepEqual(sleeps, []); // never blocks a user request
+    } finally {
+      fake.server.close();
     }
   });
 });

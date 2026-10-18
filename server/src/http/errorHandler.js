@@ -24,6 +24,7 @@ export function errorHandler(err, req, res, _next) {
     appErr.message,
   );
 
+  if (appErr.retryAfterS) res.setHeader('retry-after', String(appErr.retryAfterS));
   res.status(appErr.status).json({
     error: {
       code: appErr.code,

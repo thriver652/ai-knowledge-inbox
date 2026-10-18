@@ -41,6 +41,8 @@ export function loadConfig(overrides = {}) {
       maxTokens: int('OPENAI_MAX_TOKENS', 2_000),
       // Optional: e.g. "none"/"low" to cap thinking on reasoning models (Gemini 2.5, o-series).
       reasoningEffort: process.env.OPENAI_REASONING_EFFORT || undefined,
+      // Inputs per embeddings request. Background indexing waits out 429s between batches.
+      embedBatchSize: int('OPENAI_EMBED_BATCH_SIZE', 96),
     },
 
     chunking: {

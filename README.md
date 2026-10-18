@@ -17,7 +17,7 @@ Requires Node 22.13+ (Node 24 recommended). No native modules: storage uses Node
 npm run install:all
 cp server/.env.example server/.env    # optional: add OPENAI_API_KEY (Windows: copy)
 npm run dev                           # dev: API on :3001, hot-reloading UI on http://localhost:5173
-npm test                              # 37 API + unit tests, no network or key needed
+npm test                              # 40 API + unit tests, no network or key needed
 npm start                             # production: builds the UI, serves app + API on http://localhost:3001
 ```
 
@@ -28,6 +28,7 @@ npm start                             # production: builds the UI, serves app + 
 **Tested with Google Gemini (free tier)** through its OpenAI-compatible endpoint, with no code changes. See the commented block in `server/.env.example` (`gemini-embedding-001` + `gemini-2.5-flash`, `OPENAI_REASONING_EFFORT=none`). Two things that run surfaced, both now handled:
 - **Thinking models spend output tokens before answering.** With a 600-token cap, answers were cut off mid-list. The output budget is now configurable (default 2000), thinking can be capped, and a truncated answer logs a warning.
 - **Similarity scores aren't comparable across embedding models.** With Gemini, relevant chunks scored about 0.7–0.83 and unrelated ones about 0.47–0.55, so the `RETRIEVAL_MIN_SCORE` of 0.2 that suits the offline mode let noise through. 0.6 cleanly separates them. This is why the threshold is configuration, and why a small eval set (see production changes) is the right way to tune it.
+- **Free-tier quotas are per input, not per request.** Gemini's free tier allows 100 embedding inputs a minute, and one long Wikipedia article is about 150 chunks, so indexing it failed with a 429. Background indexing now waits out rate limits (it honours `Retry-After` or the provider's "retry in Ns" hint, up to 5 waits capped at 65 s each) and the item still becomes `ready`. Because indexing was already asynchronous, this cost the user nothing but time.
 
 ## API
 
@@ -78,7 +79,7 @@ Returns `{ item }` with `status: "pending"` and a `Location` header. Fetching th
 }
 ```
 
-`cited` tells the UI which retrieved chunks the answer actually used. If nothing clears the relevance threshold, the API says so and **skips the LLM call** rather than letting the model improvise. An AI provider failure returns `502 UPSTREAM_AI_ERROR`.
+`cited` tells the UI which retrieved chunks the answer actually used. If nothing clears the relevance threshold, the API says so and **skips the LLM call** rather than letting the model improvise. An AI provider failure returns `502 UPSTREAM_AI_ERROR`. If the provider is rate-limiting, the response is `503 AI_RATE_LIMITED` with a `Retry-After` header; an interactive question never blocks waiting on a quota.
 
 ## Code layout
 
@@ -159,10 +160,11 @@ The server fetches arbitrary user-supplied URLs, so it guards against SSRF: it r
 
 ## Testing
 
-`npm test` runs 37 tests (also in CI on every push via GitHub Actions) with Node's built-in runner against an in-memory database, fully offline:
+`npm test` runs 40 tests (also in CI on every push via GitHub Actions) with Node's built-in runner against an in-memory database, fully offline:
 
 - **Chunker:** size bounds, no mid-sentence cuts, sentence-aligned overlap, full coverage of the source, oversized sentences, decimals.
 - **API:** every status code in the tables above, validation messages per field, pagination, delete removes from search, background indexing success and failure.
 - **URL ingestion:** against a local HTTP server: redirect following, nav/script/footer stripping, 404 and wrong content type.
 - **Production serving:** the built UI is served for app routes, while unknown `/api` routes still return JSON 404s.
+- **Rate limits:** a 429 during indexing is waited out and the item still ends `ready`; a 429 during a query returns `503` with `Retry-After` immediately.
 - **OpenAI provider:** the real SDK pointed at a fake OpenAI-compatible server: checks the embeddings are reordered by index, the title header is embedded, the prompt contains numbered sources and grounding rules, citations come back, and an upstream 500 maps to `502`.

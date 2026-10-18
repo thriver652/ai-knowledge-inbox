@@ -21,4 +21,13 @@ export const Errors = {
   urlNotAllowed: (message) => new AppError(422, 'URL_NOT_ALLOWED', message),
   emptyContent: (message) => new AppError(422, 'EMPTY_CONTENT', message),
   upstream: (message) => new AppError(502, 'UPSTREAM_AI_ERROR', message),
+  rateLimited: (op, retryAfterS) => {
+    const err = new AppError(
+      503,
+      'AI_RATE_LIMITED',
+      `The AI provider is rate-limiting requests (${op}). Try again in about ${retryAfterS}s.`,
+    );
+    err.retryAfterS = retryAfterS;
+    return err;
+  },
 };

@@ -24,7 +24,8 @@ export function createIngestService({ config, itemsRepository, vectorStore, ai, 
       // Prefix each chunk with its document title before embedding ("contextual header"),
       // so a chunk that never names its topic can still be found by it.
       const header = item.title ? `${item.title}\n\n` : '';
-      const embeddings = await ai.embed(chunks.map((c) => header + c));
+      // patient: indexing is a background job, so it waits out provider rate limits.
+      const embeddings = await ai.embed(chunks.map((c) => header + c), { patient: true });
 
       vectorStore.upsertItem(
         item.id,
