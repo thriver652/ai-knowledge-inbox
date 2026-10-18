@@ -1,170 +1,162 @@
 # AI Knowledge Inbox
 
-Save short notes or URLs, then ask questions and get answers grounded in what you saved, with numbered citations back to the exact source snippets.
-
-```
-React (Vite)  ──/api──▶  Express  ──▶  SQLite (items, chunks + embeddings)
-                            │              ▲
-                            │       in-memory vector index (cosine)
-                            └──▶  OpenAI-compatible API (embeddings + chat)
-```
-
-## Quick start
-
-Requires Node 22.13+ (Node 24 recommended). No native modules: storage uses Node's built-in `node:sqlite`, so nothing needs compiling on Windows, macOS or Linux.
-
-```bash
-npm run install:all
-cp server/.env.example server/.env    # optional: add OPENAI_API_KEY (Windows: copy)
-npm run dev                           # dev: API on :3001, hot-reloading UI on http://localhost:5173
-npm test                              # 40 API + unit tests, no network or key needed
-npm start                             # production: builds the UI, serves app + API on http://localhost:3001
-```
+**Save notes and web links. Ask questions about them. Get answers that show exactly where they came from.**
 
 ![Knowledge Inbox: saved items on the left, a cited answer with its source on the right](docs/screenshot.png)
 
-**Without an API key** the app runs in an offline mode: hashed bag-of-words embeddings (lexical, not semantic) and extractive answers (the best-matching sentences, cited). Every answer shows which mode produced it. This keeps the whole app demoable and the test suite hermetic. Set `OPENAI_API_KEY` for real semantic search and LLM answers; `OPENAI_BASE_URL` points it at any OpenAI-compatible server (Ollama, Azure, vLLM).
+> 📐 **Reviewing this project?** Design decisions, tradeoffs, what breaks at scale and production changes are in **[docs/DESIGN.md](docs/DESIGN.md)**.
 
-**Tested with Google Gemini (free tier)** through its OpenAI-compatible endpoint, with no code changes. See the commented block in `server/.env.example` (`gemini-embedding-001` + `gemini-2.5-flash`, `OPENAI_REASONING_EFFORT=none`). Two things that run surfaced, both now handled:
-- **Thinking models spend output tokens before answering.** With a 600-token cap, answers were cut off mid-list. The output budget is now configurable (default 2000), thinking can be capped, and a truncated answer logs a warning.
-- **Similarity scores aren't comparable across embedding models.** With Gemini, relevant chunks scored about 0.7–0.83 and unrelated ones about 0.47–0.55, so the `RETRIEVAL_MIN_SCORE` of 0.2 that suits the offline mode let noise through. 0.6 cleanly separates them. This is why the threshold is configuration, and why a small eval set (see production changes) is the right way to tune it.
-- **Free-tier quotas are per input, not per request.** Gemini's free tier allows 100 embedding inputs a minute, and one long Wikipedia article is about 150 chunks, so indexing it failed with a 429. Background indexing now waits out rate limits (it honours `Retry-After` or the provider's "retry in Ns" hint, up to 5 waits capped at 65 s each) and the item still becomes `ready`. Because indexing was already asynchronous, this cost the user nothing but time.
+---
 
-## API
+## What it does
 
-All endpoints are under `/api`. Errors always have one shape:
+1. **You save things:** a plain-text note, or a web page URL (the server downloads the page and keeps its readable text).
+2. **You ask a question** in plain English, like *"Who do I escalate to if payments are stuck?"*
+3. **You get an answer** written only from what you saved, with numbered citations like **[1]**. Click one to see the exact snippet it came from.
 
-```json
-{ "error": { "code": "VALIDATION_ERROR", "message": "Request body is invalid.",
-             "details": [{ "field": "body.url", "message": "url must be a valid http(s) URL" }],
-             "requestId": "8f1c…" } }
+If your saved content doesn't contain the answer, the app says so. It doesn't make things up.
+
+## How it works (in 30 seconds)
+
+This is a small **RAG** app (*Retrieval-Augmented Generation*):
+
+```
+ Save:  note / URL ──► split into chunks ──► turn each chunk into numbers ("embeddings") ──► store in SQLite
+
+ Ask:   question ──► embed it ──► find the most similar chunks ──► give those chunks + question to an LLM
+                                                                         │
+                                                       answer with [1] [2] citations ◄┘
 ```
 
-`code` is stable for clients to branch on, `details` appears only for validation errors, and `requestId` matches the `x-request-id` header and every server log line for that request.
+- **Chunks** are pieces of about 800 characters, split at paragraph and sentence boundaries, so each piece is about one thing.
+- **Embeddings** are lists of numbers that capture meaning, so "backups" can match "nightly snapshot".
+- Saving returns instantly; chunking and embedding run **in the background**. Items show *Indexing…* and then *Ready*.
 
-### `POST /api/ingest` → `202 Accepted`
+## Run it locally
 
-```json
-{ "type": "note", "content": "Postgres backups run nightly at 02:00 UTC.", "title": "optional" }
-{ "type": "url",  "url": "https://example.com/post", "title": "optional" }
+You need **[Node.js](https://nodejs.org) 22.13 or newer** (Node 24 recommended). Nothing else: no database to install and nothing to compile.
+
+```bash
+git clone https://github.com/thriver652/ai-knowledge-inbox.git
+cd ai-knowledge-inbox
+npm run install:all     # installs everything (root, server, web)
+npm start               # builds the UI and starts the app
 ```
 
-Returns `{ item }` with `status: "pending"` and a `Location` header. Fetching the URL happens inside the request, so a bad URL fails fast with a specific message. Chunking and embedding happen in a background job; the item becomes `ready` or `failed` (with an `error` message).
+Open **http://localhost:3001**. That's it.
 
-| Status | Code | When |
+### No API key? It still works.
+
+With no key, the app runs in **offline mode**. Search matches shared words rather than meaning, and answers are the best-matching sentences from your notes, still cited. Every answer says which mode produced it.
+
+### Turn on real AI (optional)
+
+Copy the example settings file:
+
+```bash
+cp server/.env.example server/.env      # Windows PowerShell: copy server\.env.example server\.env
+```
+
+Then edit `server/.env` and pick **one** option:
+
+| Option | Cost | What to set in `server/.env` |
 |---|---|---|
-| 400 | `VALIDATION_ERROR` / `INVALID_JSON` | Bad body: wrong `type`, empty content, non-http URL, unknown fields |
-| 413 | `PAYLOAD_TOO_LARGE` | Body over 256 KB |
-| 422 | `URL_FETCH_FAILED` | Unreachable, timed out, non-2xx, non-HTML/text, over 2 MB |
-| 422 | `URL_NOT_ALLOWED` | Resolves to a private/loopback address (SSRF guard) |
-| 422 | `EMPTY_CONTENT` | Page has no readable text (JS-only, login wall) |
+| **OpenAI** | Paid | `OPENAI_API_KEY=sk-...` |
+| **Google Gemini** | Free tier | Get a key at [aistudio.google.com](https://aistudio.google.com), set `OPENAI_API_KEY=<your key>`, then uncomment the Gemini block in the file |
 
-### `GET /api/items?limit=50&offset=0` → `200`
+Restart with `npm start`. The grey line under each answer shows the model being used.
 
-`{ items, total, limit, offset }`, newest first. List entries carry a 280-char `preview` and `contentLength` instead of full content. `GET /api/items/:id` returns the full item; `DELETE /api/items/:id` returns `204`.
+> 🔒 `server/.env` holds your key and is git-ignored. Never commit it.
 
-### `POST /api/query` → `200`
+## Using the app
 
-```json
-{ "question": "When do backups run?", "topK": 5 }
+| To… | Do this |
+|---|---|
+| Save a note | **Note** tab → type or paste → **Save note**. The first line becomes the title. |
+| Save a web page | **URL** tab → paste a link → **Save URL** |
+| Ask a question | Type in the **Ask** box → **Ask** (wait until the item shows *Ready*) |
+| Check where an answer came from | Click a citation number such as **[1]** to jump to its source snippet |
+| Delete an item | Hover over it in the list → **Delete** |
+
+## All commands
+
+Run these from the project root:
+
+| Command | What it does |
+|---|---|
+| `npm run install:all` | Install all dependencies (do this first) |
+| `npm start` | Production mode: build the UI, serve the app and API on **:3001** |
+| `npm run dev` | Development mode: API on :3001 plus a hot-reloading UI on **:5173** |
+| `npm test` | Run the 40 automated tests (offline, no key needed) |
+| `npm run build` | Build the UI only |
+
+## Where things live
+
+```
+ai-knowledge-inbox/
+├── server/                 Backend (Node + Express)
+│   ├── src/
+│   │   ├── index.js        Starts the server
+│   │   ├── app.js          Wires all the pieces together
+│   │   ├── config.js       All settings (read from server/.env)
+│   │   ├── http/           API routes, input validation, error responses
+│   │   ├── services/       The two main flows: ingest (save) and query (ask)
+│   │   ├── rag/            Chunking, vector search, LLM prompt
+│   │   ├── ai/             AI providers: OpenAI-compatible, and the offline fallback
+│   │   ├── ingest/         Fetching web pages safely, background job queue
+│   │   └── db/             SQLite tables and queries
+│   ├── test/               Automated tests
+│   └── .env.example        Copy to .env to configure
+├── web/                    Frontend (React + Vite + Tailwind)
+│   └── src/
+│       ├── App.jsx         Page layout
+│       ├── components/     UI pieces: form, item list, answer, sources
+│       ├── hooks/          State logic: useItems (list), useAsk (questions)
+│       └── api/client.js   Talks to the backend
+└── docs/
+    ├── DESIGN.md           Design decisions, tradeoffs, scaling, API reference
+    └── screenshot.png
 ```
 
-```json
-{
-  "answer": "Backups run nightly at 02:00 UTC [1].",
-  "sources": [{ "ref": 1, "itemId": "…", "chunkId": "…", "title": "DB ops", "sourceType": "note",
-                "url": null, "snippet": "…", "score": 0.61, "cited": true }],
-  "meta": { "provider": "openai", "chatModel": "…", "retrieved": 3, "indexedChunks": 42,
-            "embedMs": 120, "searchMs": 1, "llmMs": 900, "totalMs": 1025, "usage": { … } }
-}
+**New to the code?** Read in this order:
+1. `server/src/services/ingestService.js`: what happens when you save something.
+2. `server/src/services/queryService.js`: what happens when you ask.
+3. `server/src/rag/chunker.js` and `server/src/rag/vectorStore.js`: the RAG core.
+4. `web/src/App.jsx`, then `web/src/hooks/`: the frontend.
+
+## The API in one minute
+
+The UI uses three main endpoints, and you can call them directly too:
+
+```bash
+# Save a note
+curl -X POST localhost:3001/api/ingest -H "content-type: application/json" \
+  -d '{"type":"note","content":"Backups run nightly at 02:00 UTC."}'
+
+# List saved items
+curl localhost:3001/api/items
+
+# Ask a question
+curl -X POST localhost:3001/api/query -H "content-type: application/json" \
+  -d '{"question":"When do backups run?"}'
 ```
 
-`cited` tells the UI which retrieved chunks the answer actually used. If nothing clears the relevance threshold, the API says so and **skips the LLM call** rather than letting the model improvise. An AI provider failure returns `502 UPSTREAM_AI_ERROR`. If the provider is rate-limiting, the response is `503 AI_RATE_LIMITED` with a `Retry-After` header; an interactive question never blocks waiting on a quota.
+Every error has the same shape: `{ "error": { "code", "message", "requestId" } }`. Full reference: [docs/DESIGN.md → API](docs/DESIGN.md#api).
 
-## Code layout
+## Troubleshooting
 
-```
-server/src
-  app.js                 composition root: wires everything, nothing else knows the wiring
-  config.js              all env parsing in one place
-  http/                  routes, zod schemas, validate middleware, error handler
-  services/              ingestService (two-phase ingest), queryService (retrieve → answer)
-  rag/                   chunker, vectorStore, prompt building + citation parsing
-  ai/                    provider contract + openai and offline implementations
-  ingest/                urlFetcher (SSRF guard, size/time limits, readable-text extraction), jobQueue
-  db/                    schema + repositories (all SQL lives here)
-web/src
-  api/client.js          fetch wrapper → typed ApiError with field errors and requestId
-  hooks/                 useItems (list, polling while pending, optimistic delete), useAsk (abortable)
-  components/            IngestForm, ItemList, AskPanel, AnswerView, SourceList, ErrorBanner, ErrorBoundary
-```
+| Problem | Fix |
+|---|---|
+| `'vite' is not recognized` or `Cannot find package 'express'` | Dependencies aren't installed. Run `npm run install:all`. |
+| `node:sqlite` error, or Node version warning | Upgrade Node to 22.13+ (`node -v` shows your version) |
+| Port 3001 already in use | Set `PORT=3002` in `server/.env` |
+| Item stuck on *Indexing…* for a long URL | Normal on free AI tiers: the app waits out rate limits. Large pages take a minute or two. |
+| Item shows *Failed* | Its error message says why: page not reachable, no readable text (JavaScript-only or login-required pages), or an AI key problem |
+| Answers ignore obviously related notes | Wait until the item shows *Ready*. With Gemini, keep `RETRIEVAL_MIN_SCORE=0.6`. |
+| A URL is rejected as "not allowed" | Intentional: local and private-network addresses are blocked for security |
 
-Each layer depends only on the one below it, and every dependency is injected through `createApp`, which is why tests can swap in an in-memory DB and a stub or fake AI provider without mocks.
+## Tech stack
 
-## Design decisions and tradeoffs
-
-### Chunking
-
-Structure-aware greedy packing: split into paragraphs, then sentences (only when a paragraph is too big), then words (only when a sentence is too big), and pack units up to **~800 characters** with **~150 characters of sentence-aligned overlap**.
-
-- **Why ~800 chars (~200 tokens):** small enough that a chunk is about one thing, so its embedding is not diluted and retrieval is precise; large enough to make sense on its own when shown to the LLM and the user. Most notes fit in a single chunk, which is what you want for notes.
-- **Why respect paragraphs and sentences:** fixed-size windows cut facts in half. Here no chunk starts or ends mid-sentence, and the splitter does not break on `99.9` or `v2.1`.
-- **Why overlap:** a fact that straddles a boundary still appears whole in one chunk. Overlap is whole sentences, never fragments.
-- **Contextual header:** the item's title is prepended to each chunk *before embedding* (not stored in the chunk). A chunk like "Escalate to Priya after 30 minutes" becomes findable by "on-call runbook".
-- **Not done:** token-exact sizing (character counts are a good-enough proxy for English), semantic/heading-based splitting, parent-document retrieval. Those are the next steps if retrieval quality becomes the bottleneck.
-
-### Vector store
-
-Embeddings live in SQLite as `Float32` BLOBs next to their chunks, and are mirrored in an in-memory index searched by **exact brute-force cosine** (vectors are pre-normalised, so it is a dot product).
-
-- One file, zero extra infrastructure, no native build step (Node's built-in SQLite), transactional with the items it belongs to: an item and its chunks can never drift apart, and a delete cascades.
-- Exact search has perfect recall and is fast at this scale: 10k chunks × 1536 dims is about 15M multiply-adds, a few milliseconds.
-- Each chunk records its `embedding_model`. Vectors from different models are never compared, and on startup any item without vectors for the current model is re-embedded automatically. Switching providers is safe.
-- Writes go to disk first, then the cache, so a crash cannot leave the index ahead of the database.
-
-### Async ingestion
-
-Ingest is split into a fast synchronous phase (validate, fetch URL, persist raw content) and a background phase (chunk, embed, index). The user gets an immediate, specific error for the things they can fix (bad URL, 404) while slow or flaky embedding calls never hold a request open. The UI polls only while something is `pending`. Items left `pending` by a crash are re-queued at startup.
-
-### Answer generation
-
-The system prompt restricts the model to the numbered sources, requires `[n]` citations, tells it to say when the answer is not there, and marks source text as untrusted (basic prompt-injection hygiene, since saved web pages are attacker-controllable). Citations are parsed out of the answer and validated against the real source count, so the UI never links to a source that does not exist. Temperature is 0.1.
-
-### URL fetching
-
-The server fetches arbitrary user-supplied URLs, so it guards against SSRF: it resolves the hostname and refuses loopback, private, link-local (cloud metadata) and CGNAT ranges, and it re-checks on every redirect hop (redirects are followed manually, max 3). It also enforces a 10 s timeout, a 2 MB streaming size cap, and an HTML/plain-text content-type check. Readable text is extracted with cheerio: drop `script/style/nav/header/footer/aside`, prefer `<article>`/`<main>`, keep block structure as paragraph breaks for the chunker.
-
-## What breaks at scale
-
-| Area | Breaks when | Why |
-|---|---|---|
-| Vector search | ~100k+ chunks | Brute force is O(N·d) per query and the index lives in process memory (1536 floats ≈ 6 KB per chunk) |
-| Startup | Large DB | Every embedding is loaded into memory at boot |
-| Job queue | Process restart or multiple instances | In-process queue, no retries/backoff, no visibility; one process owns the index |
-| SQLite | Concurrent writers across instances | Single writer; the in-memory index is not shared between processes |
-| Embedding calls | Bulk imports | No batching across items, no rate-limit budget; a provider 429 storm fails items |
-| URL fetching | JS-rendered pages, paywalls, PDFs | Plain HTTP fetch + HTML extraction only; DNS-rebinding gap between check and connect |
-| Retrieval quality | Exact identifiers, acronyms, error codes | Pure dense retrieval misses exact-match terms; one fixed `minScore` doesn't fit every model |
-| Context window | Large `topK` × long chunks | No token budgeting before the LLM call |
-| Answer latency | Long answers | No streaming; the user waits for the full completion |
-
-## What I'd change for production
-
-1. **Vector store:** Postgres + pgvector (HNSW) so items, chunks and vectors share one transactional store with real concurrency; or sqlite-vec if it stays single-node. Same `vectorStore` interface, nothing else changes.
-2. **Ingestion pipeline:** a durable queue (BullMQ/SQS) with retries, exponential backoff, a dead-letter queue and idempotency keys; batch embeddings across items; content-hash dedupe so re-saving a URL doesn't re-embed it.
-3. **Retrieval quality:** hybrid search (BM25/FTS5 + dense, merged with reciprocal-rank fusion), a cross-encoder reranker over the top ~30, MMR to diversify sources, and a small labelled eval set (question → expected item) to tune chunk size, `topK` and `minScore` with numbers instead of intuition.
-4. **Answers:** stream tokens over SSE; token-budget the context; structured output (JSON with answer + cited refs) instead of regex-parsing `[n]`; cache embeddings for repeated questions.
-5. **URL fetching:** run through an egress proxy (fixes DNS rebinding), a headless browser for JS-rendered pages, a proper readability extractor, PDF support, robots.txt and per-domain rate limits.
-6. **Multi-user:** auth, a `user_id` on every row and every vector query (tenant isolation enforced in the query, not the UI), per-user quotas and cost tracking.
-7. **Operability:** OpenTelemetry traces across fetch → embed → search → LLM, metrics (ingest latency, failure rate, tokens, cost per query, retrieval scores), real migrations, request rate limiting, and serving the built frontend from the API or a CDN.
-
-## Testing
-
-`npm test` runs 40 tests (also in CI on every push via GitHub Actions) with Node's built-in runner against an in-memory database, fully offline:
-
-- **Chunker:** size bounds, no mid-sentence cuts, sentence-aligned overlap, full coverage of the source, oversized sentences, decimals.
-- **API:** every status code in the tables above, validation messages per field, pagination, delete removes from search, background indexing success and failure.
-- **URL ingestion:** against a local HTTP server: redirect following, nav/script/footer stripping, 404 and wrong content type.
-- **Production serving:** the built UI is served for app routes, while unknown `/api` routes still return JSON 404s.
-- **Rate limits:** a 429 during indexing is waited out and the item still ends `ready`; a 429 during a query returns `503` with `Retry-After` immediately.
-- **OpenAI provider:** the real SDK pointed at a fake OpenAI-compatible server: checks the embeddings are reordered by index, the title header is embedded, the prompt contains numbered sources and grounding rules, citations come back, and an upstream 500 maps to `502`.
+**Backend:** Node.js, Express 5, SQLite (built into Node), Zod (validation), Pino (structured JSON logs), Cheerio (HTML extraction), OpenAI SDK (works with any OpenAI-compatible API)
+**Frontend:** React 19 with hooks, Vite, Tailwind CSS
+**Quality:** 40 tests with Node's built-in test runner; GitHub Actions CI on every push
