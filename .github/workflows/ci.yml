@@ -12,6 +12,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: npm ci && npm --prefix server ci && npm --prefix web ci
+      - run: npm ci && cd server && npm ci && cd ../web && npm ci
       - run: npm test
       - run: npm run build
